@@ -40,3 +40,4 @@ else()
 endif()
 
 add_subdirectory(retrieval)
+add_subdirectory(prefetch)

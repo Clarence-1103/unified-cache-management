@@ -145,7 +145,7 @@ def main():
 
     with build_llm_with_uc(module_path, name, model) as llm:
         prompts = []
-        batch_size = 20
+        batch_size = 100
         assert os.path.isfile(
             path_to_dataset
         ), f"Incorrect dataset path. Please specify the dataset path by `export DATASET_PATH=/path/to/longbench/multifieldqa_zh.jsonl`"
@@ -156,12 +156,14 @@ def main():
             data = json.loads(line)
             prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
             prompts.append(get_prompt(prompt))
-
+        
         sampling_params = SamplingParams(
-            temperature=0, top_p=0.95, max_tokens=256, ignore_eos=False
+            temperature=0, top_p=0.95, max_tokens=256, ignore_eos=True
         )
 
         print_output(llm, prompts, sampling_params, "first")
+        llm.reset_prefix_cache()
+        print_output(llm, prompts, sampling_params, "second")
 
 
 if __name__ == "__main__":

@@ -545,7 +545,7 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        logger.info(f"get_num_new_matched_tokens request {request.request_id}.")
+        ## logger.info(f"get_num_new_matched_tokens request {request.request_id}.")
 
         if request.status == RequestStatus.PREEMPTED:
             logger.info(f"Handle preempted request {request.request_id}.")
@@ -609,11 +609,11 @@ class UnifiedCacheConnectorV1(KVConnectorBase_V1):
             else:
                 # TODO we will fix hole match later
                 break
-        logger.info(
-            f"num_total_blocks: {len(block_hashes)}, "
-            f"num_lookup_hits on hbm: {start_position}, "
-            f"num_lookup_hits on storage except hbm: {num_lookup_hits}"
-        )
+        # logger.info(
+        #     f"num_total_blocks: {len(block_hashes)}, "
+        #     f"num_lookup_hits on hbm: {start_position}, "
+        #     f"num_lookup_hits on storage except hbm: {num_lookup_hits}"
+        # )
 
         # Load async when Decode instance need to load
         if hasattr(self, "kv_role") and self.kv_role == "kv_consumer":
