@@ -1,0 +1,4 @@
+Result file: /home/sxl/va_test/unified-cache-management/ucm_sparse_results/DeepSeek-V2-Lite-Chat/LongBench/multifieldqa_zh_ucm_sparse_config_esa_1_2_4_0.2_10_bs1.jsonl
+50 score: 55.71
+All score: 58.83
+

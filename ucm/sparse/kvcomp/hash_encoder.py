@@ -27,10 +27,64 @@ import torch
 if hasattr(torch, "npu") and torch.npu.is_available():
     import torch_npu
 
-from ucm.logger import init_logger
+#from ucm.logger import init_logger
 
-logger = init_logger(__name__)
+#logger = init_logger(__name__)
 
+if hasattr(torch, "cuda") and torch.cuda.is_available():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def triton_matmul_kernel(x_flat, hash_weights, output, BLOCK_SIZE: tl.constexpr):
+        """
+        Triton kernel to perform matrix multiplication (x_flat @ hash_weights) and project values to uint8.
+        Args:
+            x_flat: Input tensor of shape [N, input_dim]
+            hash_weights: Weight matrix of shape [input_dim, hash_bits]
+            output: Output tensor to store the projected values as uint8
+            BLOCK_SIZE: Block size for Triton kernel
+        """
+        # Get program id (block id) for row
+        pid = tl.program_id(0)
+        idx = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32) # Thread index in the block
+
+        # Perform matrix multiplication: x_flat @ hash_weights
+        matmul_result = tl.dot(x_flat[idx, :], hash_weights)
+
+        # Project the result to uint8 by comparing to 0 (matmul_result > 0)
+        projected = (matmul_result > 0).to(tl.uint8)
+
+        # Store the projected result into the output tensor
+        tl.store(output + idx, projected)
+
+    @triton.jit
+    def triton_pack_hash_kernel(output, bit_masks, packed_codes, hash_numbers, BLOCK_SIZE: tl.constexpr):
+        """
+        Triton kernel to pack the binary values into uint8 hash codes.
+        Args:
+            output: Projected values as uint8 with shape [N, hash_bits]
+            bit_masks: The bit masks used for packing the bits
+            packed_codes: The packed uint8 hash codes
+            N: Number of rows (samples)
+            hash_numbers: Number of uint8 numbers (hash_bits // 8)
+            BLOCK_SIZE: Block size for Triton kernel
+        """
+        # Get program id (block id) for row
+        pid = tl.program_id(0)
+        idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)  # Thread index in the block
+
+        # Load the projected values for the current thread
+        projected = tl.load(output + idx)  # Shape: [N, hash_bits]
+
+        # [N, hash_numbers, 8]
+        binary_codes = projected.view(-1, hash_numbers, 8)
+
+        # Perform bitwise packing: binary_codes * bit_masks
+        packed_codes_flat = tl.sum(binary_codes * bit_masks, axis=-1, dtype=tl.uint8)
+
+        # Store the packed codes into the packed_codes tensor
+        tl.store(packed_codes + idx, packed_codes_flat)
 
 class HashEncoder:
     """
@@ -136,20 +190,36 @@ class HashEncoder:
         if x_flat.dtype != self.dtype:
             x_flat = x_flat.to(self.dtype)
 
-        # [N, hash_bits]
-        xW = torch.matmul(x_flat, self.hash_weights)
-
-        # [N * hash_bits]
-        xW_flat = xW.view(-1)
-
         if self.device.type == "npu":
+            # [N, hash_bits]
+            xW = torch.matmul(x_flat, self.hash_weights)
+            # [N * hash_bits]
+            xW_flat = xW.view(-1)
             # [N*hash_numbers], where hash_numbers = hash_bits // 8
             packed_codes_flat = torch_npu.npu_sign_bits_pack(xW_flat, size=1)
-        elif self.device.type == "cuda" or self.device.type == "cpu":
-            # (TODO) improve performance later on CUDA ops and CPU SIMD instructions
+        
+        elif self.device.type == "cuda":
+            N = x_flat.shape[0]
+            BLOCK_SIZE = 32
+
+            # Allocate output tensors
+            projected_output = torch.empty((N, self.hash_bits), dtype=torch.uint8, device=self.device)
+            packed_codes = torch.empty((N, self.hash_numbers), dtype=torch.uint8, device=self.device)
+
+            # Launch Triton kernel for matrix multiplication and projection
+            grid = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+            triton_matmul_kernel[grid](x_flat, self.hash_weights, projected_output, BLOCK_SIZE=BLOCK_SIZE)
+
+            # Launch Triton kernel for packing binary values
+            grid = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
+            triton_pack_hash_kernel[grid](projected_output, self.bit_masks, packed_codes, self.hash_numbers, BLOCK_SIZE=BLOCK_SIZE)
+            packed_codes_flat = packed_codes.view(-1)  # [N * hash_numbers]
+            
+        elif self.device.type == "cpu":
+            # [N, hash_bits]
+            xW = torch.matmul(x_flat, self.hash_weights)
             # [N, hash_bits]
             projected = (xW > 0).to(torch.uint8)
-
             # [N, hash_numbers, 8]
             binary_codes = projected.view(-1, self.hash_numbers, 8)
 
@@ -232,10 +302,12 @@ class HashEncoder:
 
 
 if __name__ == "__main__":
+    dtype = torch.float16
     if hasattr(torch, "npu") and torch.npu.is_available():
         device = torch.device("npu:0")
     elif hasattr(torch, "cuda") and torch.cuda.is_available():
         device = torch.device("cuda:0")
+        dtype=torch.float32
     else:
         device = torch.device("cpu")
 
@@ -243,9 +315,9 @@ if __name__ == "__main__":
 
     torch.manual_seed(42)
 
-    encoder = HashEncoder(input_dim=8, hash_bits=8, dtype=torch.float16, device=device)
+    encoder = HashEncoder(input_dim=8, hash_bits=8, dtype=dtype, device=device)
 
-    x = torch.randn(2, 8, device=device, dtype=torch.float16)
+    x = torch.randn(2, 8, device=device, dtype=dtype)
     print("x:", x)
 
     hash_codes = encoder.compute_hash(x)

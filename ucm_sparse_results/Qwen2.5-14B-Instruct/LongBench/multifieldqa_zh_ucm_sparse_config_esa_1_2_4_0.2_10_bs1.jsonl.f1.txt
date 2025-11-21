@@ -1,0 +1,4 @@
+Result file: /home/sxl/va_test/unified-cache-management/ucm_sparse_results/Qwen2.5-14B-Instruct/LongBench/multifieldqa_zh_ucm_sparse_config_esa_1_2_4_0.2_10_bs1.jsonl
+50 score: 63.3
+All score: 63.75
+

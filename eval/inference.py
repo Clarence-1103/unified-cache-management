@@ -4,7 +4,6 @@ import os
 import sys
 import time
 from dataclasses import asdict
-
 from transformers import AutoTokenizer
 
 # Third Party
@@ -17,7 +16,7 @@ from ucm.logger import init_logger
 logger = init_logger(__name__)
 model = ""
 path_to_dataset = ""
-data_dir = ""
+data_dir = "/home/sxl/va_test/kvcache/data_esa_test"
 tokenizer = None
 
 
@@ -25,7 +24,7 @@ def setup_environment_variables():
     os.environ["VLLM_USE_V1"] = "1"
     os.environ["PYTHONHASHSEED"] = "123456"
 
-    global model, path_to_dataset, data_dir, tokenizer
+    global model, path_to_dataset, data_dir, ucm_sparse_config, dataset_name, tokenizer
     model = os.getenv("MODEL_PATH", "/home/models/Qwen2.5-14B-Instruct")
     if not os.path.isdir(model):
         model = input("Enter path to model, e.g. /home/models/Qwen2.5-14B-Instruct: ")
@@ -34,17 +33,17 @@ def setup_environment_variables():
             sys.exit(1)
 
     path_to_dataset = os.getenv(
-        "DATASET_PATH", "/home/data/Longbench/data/multifieldqa_zh.jsonl"
+        "DATASET_FLIE", "/home/data/Longbench/data/multifieldqa_zh.jsonl"
     )
     if not os.path.isfile(path_to_dataset):
         path_to_dataset = input(
             "Enter path to one of the longbench dataset, e.g. /home/data/Longbench/data/multifieldqa_zh.jsonl: "
         )
         if not os.path.isfile(path_to_dataset):
-            print("Exiting. Incorrect dataset path")
+            print("Exiting. Incorrect dataset file path")
             sys.exit(1)
 
-    data_dir = os.getenv("DATA_DIR", "/home/data/kv_cache")
+    data_dir = os.getenv("STORAGE_BACKENDS", "/home/data/kv_cache")
     if not os.path.isdir(data_dir):
         data_dir = input(
             "Enter the directory for UCMStore to save kv cache, e.g. /home/data/kv_cache: "
@@ -56,7 +55,21 @@ def setup_environment_variables():
             print("Exiting. Directory not created.")
             sys.exit(1)
 
-    tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=True)
+    sparse_config_path =  os.getenv("UCM_SPARSE_CONFIG", "eval/ucm_sparse_config.json")
+    if not os.path.isfile(sparse_config_path):
+        sparse_config_path = input(
+            "Enter path to one of the sparse config json, e.g. eval/ucm_sparse_config.json: "
+        )
+        if not os.path.isfile(sparse_config_path):
+            print("Exiting. Incorrect config json file path")
+            sys.exit(1)
+
+    with open(sparse_config_path, 'r', encoding='utf-8') as f:
+        ucm_sparse_config = json.load(f) 
+
+    dataset_name = os.getenv('file_name_no_ext',"multifieldqa_zh")
+
+    tokenizer = AutoTokenizer.from_pretrained(model, use_chat_template=False)
 
 
 @contextlib.contextmanager
@@ -71,15 +84,8 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
                 "storage_backends": data_dir,
                 "kv_block_size": 33554432,
             },
-            "ucm_sparse_config": {
-                "ESA": {
-                    "init_window_sz": 1,
-                    "local_window_sz": 2,
-                    "min_blocks": 4,
-                    "sparse_ratio": 0.3,
-                    "retrieval_stride": 5,
-                }
-            },
+            "ucm_sparse_config": ucm_sparse_config
+        
         },
     )
 
@@ -91,9 +97,9 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         max_num_batched_tokens=30000,
         block_size=128,
         enforce_eager=True,
+        trust_remote_code = True,
         distributed_executor_backend="mp",
         tensor_parallel_size=1,
-        trust_remote_code=True,
     )
 
     llm = LLM(**asdict(llm_args))
@@ -109,6 +115,7 @@ def print_output(
     sampling_params: SamplingParams,
     req_str: str,
 ):
+    
     start = time.time()
     outputs = llm.generate(prompt, sampling_params)
     print("-" * 50)
@@ -116,11 +123,15 @@ def print_output(
     for output in outputs:
         generated_text = output.outputs[0].text
         print(f"Generated text: {generated_text!r}")
-        lines.append(generated_text + "\n")
+        # generated_text = generated_text.replace('\n', '').replace('"', '')
+        generated_text = ''.join([
+                            line.strip()  # 去除每行首尾的空白（包括空格、制表符等）
+                            for line in generated_text.splitlines()  # 按所有换行符（\n、\r\n 等）拆分
+                            if line.strip()  # 只保留非空行（过滤空行和仅含空白的行）
+                            ])
+        lines.append(generated_text )
     print(f"Generation took {time.time() - start:.2f} seconds, {req_str} request done.")
-    with open("./newest_out.txt", "w") as f:
-        f.writelines(lines)
-    print("-" * 50)
+    return lines
 
 
 def main():
@@ -144,26 +155,46 @@ def main():
         )
 
     with build_llm_with_uc(module_path, name, model) as llm:
-        prompts = []
-        batch_size = 100
-        assert os.path.isfile(
-            path_to_dataset
-        ), f"Incorrect dataset path. Please specify the dataset path by `export DATASET_PATH=/path/to/longbench/multifieldqa_zh.jsonl`"
+        res_file =  os.getenv("RES_FILE", "/home/ucm_sparse_output/longbench.jsonl")
+        batch_size = 20
         with open(path_to_dataset, "r") as f:
             lines = f.readlines()
-        for i in range(batch_size):
-            line = lines[i]
-            data = json.loads(line)
-            prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
-            prompts.append(get_prompt(prompt))
+    
+        total_data = len(lines)
+        for start_idx in range(0, total_data, batch_size):
+            end_idx = min(start_idx + batch_size, total_data)
+            current_batch = lines[start_idx:end_idx]
+            prompts = []
+            answers = []
+            for line in current_batch:
+                data = json.loads(line)
+                answer = data["answers"][0]
+                # if dataset_name == "multifieldqa_zh":
+                prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+                # else:
+                    # prompt = f"""请基于给定的文章回答下述问题。\n\n{data["context"]}\n\n请基于上述文章回答下面的问题。\n\n问题：{data["input"]}\n回答："""
+                # prompts.append(prompt)
+                prompts.append(get_prompt(prompt))
+                answers.append(answer)
+            
+            sampling_params = SamplingParams(
+                temperature=0, top_p=0.95, max_tokens=64, ignore_eos=False
+            )
+            
+            gen_res =  print_output(llm, prompts, sampling_params, f"{len(current_batch)}")
 
-        sampling_params = SamplingParams(
-            temperature=0, top_p=0.95, max_tokens=256, ignore_eos=True
-        )
+            with open(res_file, "a", encoding="utf-8") as file:
+                for generated_text, ori_answer in zip(gen_res, answers):
+             
+                    json_obj = {
+                        "pred": generated_text,
+                        "answers": [ori_answer]
+                    }
+               
+                    file.write(json.dumps(json_obj, ensure_ascii=False) + "\n")
 
-        print_output(llm, prompts, sampling_params, "first")
-        llm.reset_prefix_cache()
-        print_output(llm, prompts, sampling_params, "second")
+         
+
 
 
 if __name__ == "__main__":

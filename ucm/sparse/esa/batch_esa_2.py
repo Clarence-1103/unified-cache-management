@@ -117,23 +117,6 @@ class ESASparseMetaData(UcmSparseMetadata):
         )
         self.requests.append(meta)
 
-
-@cache
-def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) -> int:
-    block_size, num_key_heads_per_tp, head_size = block_shape
-    k_min_data_block_size = block_size * num_key_heads_per_tp * head_size * precision
-    v_min_data_block_size = k_min_data_block_size if not is_mla else 0
-    layer_size = (k_min_data_block_size + v_min_data_block_size) * (
-        tp_size if not is_mla else 1
-    )
-    if is_mla:
-        k_offset = layer_size * layer_id
-    else:
-        k_offset = layer_size * layer_id + layer_size // tp_size * rank
-    v_offset = k_offset + k_min_data_block_size
-    return v_offset if is_v else k_offset
-
-
 @cache
 def get_sparse_range(init_window_sz, local_window_sz, prompt_len, block_size):
     num_blocks_upper_bound = math.ceil(prompt_len / block_size)
@@ -186,7 +169,6 @@ class ReqStatePerLayer:
         layer_name: str,
         rank: int,
         tp_size: int,
-        store_instance: UcmKVStoreBase,
         vllm_config: VllmConfig,
         retrieval_worker: Optional[RetrievalWorker] = None,
         repre_pool: Optional[ReprePool] = None,
@@ -196,7 +178,6 @@ class ReqStatePerLayer:
         self.slots = []
         self.slots_to_relative_indexes = {}
         self.repre_pool: ReprePool | None = repre_pool
-        self.store_instance = store_instance
         self.retrieval_worker: Optional[RetrievalWorker] = retrieval_worker
         self.retrieval_task = None
         self.req_meta = None
@@ -252,47 +233,6 @@ class ReqStatePerLayer:
     def update_meta(self, req_meta: ReqMeta):
         self.req_meta = req_meta
 
-    def launch_transfer_task(self, transfer_type, block_hashes, vllm_block_ids, tasks: Dict[str, Task]):
-        fn = getattr(self.store_instance, transfer_type)
-        length = len(block_hashes)
-        block_shape = (self.block_size, self.num_key_heads, self.head_size)
-        precision = self.vllm_config.model_config.dtype.itemsize
-
-        block_shape = tuple(block_shape)
-        offsets_k = [
-            get_offset(
-                block_shape,
-                self.rank,
-                self.tp_size,
-                precision,
-                self.layer_id,
-                is_v=False,
-                is_mla=self.is_mla,
-            )
-        ] * length
-
-        key_src_tensors = [self.k_cache[id_] for id_ in vllm_block_ids]
-        task_k = fn(block_hashes, offsets_k, key_src_tensors)
-        task_k_hash = task_hash_func(block_hashes, transfer_type, "key")
-        tasks[task_k_hash] = task_k
-
-        if not self.is_mla:
-            offsets_v = [
-                get_offset(
-                    block_shape,
-                    self.rank,
-                    self.tp_size,
-                    precision,
-                    self.layer_id,
-                    is_v=True,
-                    is_mla=self.is_mla,
-                )
-            ] * length
-            value_src_tensors = [self.v_cache[id_] for id_ in vllm_block_ids]
-            task_v = fn(block_hashes, offsets_v, value_src_tensors)
-            task_v_hash = task_hash_func(block_hashes, transfer_type, "value")
-            tasks[task_v_hash] = task_v
-    
     def extract_block_repre(self, vllm_block_ids):
         if not self.is_mla:
             return self.k_cache[vllm_block_ids].mean(1)
@@ -412,34 +352,6 @@ class ReqStatePerLayer:
         return len(req_block_hashes)
             
 
-    def wait_retrieval_and_start_load(self, tasks: Dict[str, Task]):
-        self.retrieval_worker.wait(self.retrieval_task)
-        result = self.retrieval_worker.get_result(self.retrieval_task)
-        choosed_slots = result["indices"][0]
-        rel_block_ids = [self.slots_to_relative_indexes[int(e)] for e in choosed_slots]
-        block_hashes = [self.block_hashes[id_] for id_ in rel_block_ids]
-        top_k = int(self.sparse_range * self.esa_cfg["sparse_ratio"])
-        vllm_block_ids = self.req_meta.vllm_block_ids[
-            self.esa_cfg["init_window_sz"] : self.esa_cfg["init_window_sz"] + top_k
-        ]
-        ## 1. load delta
-        target_map = {
-            b_id: b_hash for b_id, b_hash in zip(vllm_block_ids, block_hashes)
-        }
-        self.pre_topk_block_hashes, diff_blocks = diff_two_map(
-            self.pre_topk_block_hashes, target_map
-        )
-        self.launch_transfer_task(
-            "load", list(diff_blocks.values()), list(diff_blocks.keys()), tasks
-        )
-
-        ## 2. load all
-        # self.launch_transfer_task(
-        #     "load", block_hashes, vllm_block_ids
-        # )
-
-        self.retrieval_task = None
-    
     def block_repre_data(self):
         self.sparse_range = get_sparse_range(
             self.esa_cfg["init_window_sz"],
@@ -483,11 +395,12 @@ class ReqStatePerLayer:
 
     def attention_begin(
         self,
+        batch_transfer_data: Dict[str, Any],
+        transfer_data_index: int,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         forward_context: ForwardContext,
-        tasks: Dict[str, Task],
     ) -> None:
         self.maybe_register_static_data(forward_context)
         if self.step == 1:
@@ -521,7 +434,9 @@ class ReqStatePerLayer:
                 )
                 self.k_cache[vllm_block_ids[-local_window_sz:]] = self.local_window
             self.start_retrieval(query, forward_context)
-            self.wait_retrieval_and_start_load(tasks)
+            ## 输入参数添加offset、输出添加count写入了多少 
+            return self.wait_retrieval_and_prepare_transfer_data(batch_transfer_data, transfer_data_index)
+        return 0
 
     def attention_finished(
         self,
@@ -647,7 +562,7 @@ class ESA(UcmSparseBase):
         self.global_step = 0
     
     def execute_begin(self, scheduler_output):
-        ## print("=== ESA execute_begin ===")
+        print("=== ESA execute_begin ===")
         self.global_step += 1
     
     def get_or_create_layerwise_req_state(self, req_meta, layer_name):
@@ -666,7 +581,6 @@ class ESA(UcmSparseBase):
                 layer_name,
                 self.rank,
                 self.tp_size,
-                self.connector,
                 self._vllm_config,
                 self.retrieval_workers[layer_id],
                 self.layer_pools[layer_id],
@@ -678,7 +592,7 @@ class ESA(UcmSparseBase):
     ):
         req_state = self.get_or_create_layerwise_req_state(req_meta, layer_name)
         req_state.update_meta(req_meta)
-        req_state.attention_begin(query, key, value, forward_context, self.tasks)
+        return req_state.attention_begin(self.batch_transfer_data, self.transfer_data_index, query, key, value, forward_context)
 
     def launch_transfer_task(self, transfer_type):
         fn = getattr(self.connector, transfer_type)
@@ -737,24 +651,40 @@ class ESA(UcmSparseBase):
         self.transfer_data_count = 0
         if not self.is_mla:
             for req_meta in self._sparse_metadata.requests:
-                self.create_req_state_attention_begin(
+                self.transfer_data_index = self.transfer_data_count
+                self.transfer_data_count += self.create_req_state_attention_begin(
                     req_meta, layer_name, query, key, value, forward_context
                 )
         else:
             if phase == "prefill":
                 for req_meta in self._sparse_metadata_prefill.requests:
-                    self.create_req_state_attention_begin(
+                    self.transfer_data_index = self.transfer_data_count
+                    self.transfer_data_count += self.create_req_state_attention_begin(
                         req_meta, layer_name, query, key, value, forward_context
                     )
             if phase == "decode":
                 for req_meta in self._sparse_metadata_decode.requests:
-                    self.create_req_state_attention_begin(
+                    self.transfer_data_index = self.transfer_data_count
+                    self.transfer_data_count += self.create_req_state_attention_begin(
                         req_meta, layer_name, query, key, value, forward_context
-                    )
+                    ) 
         
-        if self.global_step % self.esa_cfg["retrieval_stride"] == 1:
-            ## 等待transfer任务完成
-            self.wait_transfer_task_done()
+        ## 只在有req在step=1时去load数据
+        if self.transfer_data_count > 0:
+            layer_id = int(layer_name.split(".")[2])
+            self.batch_transfer_data["offsets_k"][:self.transfer_data_count] = [
+                self.offsetk_per_layer[layer_id]
+            ] * self.transfer_data_count
+
+            if not self.is_mla:
+                self.batch_transfer_data["offsets_v"][:self.transfer_data_count] = [
+                    self.offsetv_per_layer[layer_id]
+                ] * self.transfer_data_count
+            # load data to HBM
+            self.launch_transfer_task("load_sparse")  ## init_topk context, 
+        
+        ## 等待transfer任务完成
+        self.wait_transfer_task_done()
 
     def update_req_state_attention_end(
         self, req_meta, layer_name, query, key, value, attn_output, forward_context
@@ -812,8 +742,8 @@ class ESA(UcmSparseBase):
                         attn_output,
                         forward_context,
                     )
-        ## 只在有数据在decode阶段step % stride == 0时去load数据
-        if self.global_step % self.esa_cfg["retrieval_stride"] == 0:
+        ## 只在有数据在decode阶段step % stride = 5时去load数据
+        if self.transfer_data_count > 0:
             layer_id = int(layer_name.split(".")[2])
             self.batch_transfer_data["offsets_k"][:self.transfer_data_count] = [
                 self.offsetk_per_layer[layer_id]

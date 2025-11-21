@@ -51,7 +51,8 @@ class UcmNfsStore(UcmKVStoreBase):
         if transfer_enable:
             param.transferDeviceId = config["device"]
             param.transferIoSize = config["io_size"]
-            param.transferIoDirect = config.get("transferIoDirect", False)
+            if hasattr(param, "transferIoDirect"):
+                param.transferIoDirect = config.get("transferIoDirect", False)
 
         # NOTE: compatible with legacy nfsstore lib
         if hasattr(param, "storageCapacity"):
@@ -88,6 +89,14 @@ class UcmNfsStore(UcmKVStoreBase):
         )
         return NfsTask(task_id=task_id)
 
+    def load_sparse(
+        self, block_ids: List[str], offset: List[int], dst_tensor_ptr: List[int], dst_tensor_size: List[int]
+    ) -> Task:
+        task_id = self.store.LoadToDevice(
+            block_ids, offset, dst_tensor_ptr, dst_tensor_size
+        )
+        return NfsTask(task_id=task_id)
+    
     def dump(
         self, block_ids: List[str], offset: List[int], src_tensor: List[torch.Tensor]
     ) -> Task:

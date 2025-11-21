@@ -24,32 +24,38 @@
 
 from __future__ import annotations
 
+from torch.library import Library
+
 from ucm.logger import init_logger
 
 logger = init_logger(__name__)
+import sys
+
+_UCM_UNIFIED_ATTENTION_WITH_OUTPUT_REGISTERED = False
 
 
 def _apply_adapt_patches() -> None:
     try:
+        _patch_block_pool()
+        _patch_block_table()
+        _patch_base_get_block_ids_with_load_errors()
+        _patch_single_type_kv_cache_manager_cache_blocks()
+        _patch_kv_cache_manager()
+        _patch_shared_storage_connector()
+        _patch_attention_layer()
+        _patch_mla_common()
+        _patch_model_runner_output()
+        _patch_gpu_model_runner()
+        _patch_gpu_worker_execute_model()
+        _patch_gpu_worker()
         _patch_cached_request_data()
+        _patch_input_batch()
         _patch_scheduler_output()
+        _patch_scheduler()
         _patch_request_succeed_dumped_blocks()
         _patch_multi_connector()
-        _patch_model_runner_output()
-        _patch_base_get_block_ids_with_load_errors()
-        _patch_block_pool()
-        _patch_single_type_kv_cache_manager_cache_blocks()
         _patch_multiproc_executor()
-        _patch_input_batch()
-        _patch_gpu_worker_execute_model()
-        _patch_attention_layer()
-        _patch_shared_storage_connector()
-        _patch_mla_common()
-        _patch_kv_cache_manager()
-        _patch_scheduler()
-        _patch_block_table()
-        _patch_gpu_model_runner()
-        _patch_gpu_worker()
+
     except Exception as e:
         logger.error(f"Failed to apply aggre patch: {e}", exc_info=True)
         raise
@@ -788,12 +794,11 @@ def _patch_gpu_worker_execute_model() -> None:
 
 # ==================== vllm/attention/layer.py  ====================
 def _patch_attention_layer() -> None:
-    """Patch attention layer to add UCM sparse support."""
+    """Patch attention layer & unified_attention_with_output C++ op."""
     try:
         from typing import Optional
 
         import torch
-        from vllm.attention import layer
         from vllm.attention.layer import (
             maybe_save_kv_layer_to_connector,
             wait_for_kv_layer_from_connector,
@@ -823,10 +828,6 @@ def _patch_attention_layer() -> None:
                 query, key, value, layer_name, forward_context, phase
             )
 
-        layer.maybe_execute_sparse_attention_begin = (
-            maybe_execute_sparse_attention_begin
-        )
-
         def maybe_execute_sparse_attention_finished(
             query: torch.Tensor,
             key: torch.Tensor,
@@ -849,16 +850,35 @@ def _patch_attention_layer() -> None:
                 query, key, value, attn_output, layer_name, forward_context, phase
             )
 
-        layer.maybe_execute_sparse_attention_finished = (
-            maybe_execute_sparse_attention_finished
-        )
+        vllm_ops = torch.ops.vllm
+        orig_unified_attention_with_output = vllm_ops.unified_attention_with_output
+        orig_unified_attention = vllm_ops.unified_attention
 
-        def unified_attention(
+        def _wrap_op_overload(orig, impl):
+            class _Wrapper:
+                """包装原 OpOverloadPacket，只重写 __call__，其他属性透传."""
+
+                def __init__(self, orig):
+                    self._orig = orig
+
+                def __call__(self, *args, **kwargs):
+                    return impl(*args, **kwargs)
+
+                def __getattr__(self, name):
+                    # 保证 .default / .overload 等还能用
+                    return getattr(self._orig, name)
+
+            return _Wrapper(orig)
+
+        
+
+        def unified_attention_impl(
             query: torch.Tensor,
             key: torch.Tensor,
             value: torch.Tensor,
             layer_name: str,
         ) -> torch.Tensor:
+            print("=========== [UCM PATCH] unified_attention HIT", layer_name, flush=True)
             wait_for_kv_layer_from_connector(layer_name)
 
             forward_context: ForwardContext = get_forward_context()
@@ -877,9 +897,8 @@ def _patch_attention_layer() -> None:
             maybe_save_kv_layer_to_connector(layer_name, kv_cache)
             return output
 
-        layer.unified_attention = unified_attention
-
-        def unified_attention_with_output(
+        # ------- 重点：覆盖 C++ op 的实现 --------
+        def unified_attention_with_output_impl(
             query: torch.Tensor,
             key: torch.Tensor,
             value: torch.Tensor,
@@ -887,6 +906,7 @@ def _patch_attention_layer() -> None:
             layer_name: str,
             output_scale: Optional[torch.Tensor] = None,
         ) -> None:
+            ## print("=========== [UCM PATCH] unified_attention_with_output HIT", layer_name, flush=True)
             wait_for_kv_layer_from_connector(layer_name)
             forward_context: ForwardContext = get_forward_context()
             attn_metadata = forward_context.attn_metadata
@@ -912,9 +932,25 @@ def _patch_attention_layer() -> None:
                 maybe_execute_sparse_attention_finished(
                     query, key, value, output, layer_name, forward_context
                 )
+
             maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
-        layer.unified_attention_with_output = unified_attention_with_output
+        vllm_ops.unified_attention_with_output = _wrap_op_overload(
+            orig_unified_attention_with_output, unified_attention_with_output_impl
+        )
+        vllm_ops.unified_attention = _wrap_op_overload(
+            orig_unified_attention, unified_attention_impl
+        )
+        from vllm.attention import layer
+
+        layer.maybe_execute_sparse_attention_begin = (
+            maybe_execute_sparse_attention_begin
+        )
+        layer.maybe_execute_sparse_attention_finished = (
+            maybe_execute_sparse_attention_finished
+        )
+        layer.unified_attention = unified_attention_impl
+        layer.unified_attention_with_output = unified_attention_with_output_impl
 
     except ImportError:
         logger.warning(
