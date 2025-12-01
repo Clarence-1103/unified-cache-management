@@ -29,6 +29,7 @@ from ucm.store.ucmstore import Task, UcmKVStoreBase
 
 ReqType = Union[str, int]
 HashType = Union[str, int]
+import time
 
 data = None
 
@@ -336,7 +337,10 @@ class ReqStatePerLayer:
         )
 
     def wait_retrieval_and_start_load(self):
+        ##start_time = time.perf_counter_ns()
         self.retrieval_worker.wait(self.retrieval_task)
+        ##end_time = time.perf_counter_ns()
+        ##print(f"[UCM DEBUG] req_id: {self.retrieval_task}  retrieval time: {(end_time - start_time):.4f} ns")
         result = self.retrieval_worker.get_result(self.retrieval_task)
         choosed_slots = result["indices"][0]
         rel_block_ids = [self.slots_to_relative_indexes[int(e)] for e in choosed_slots]
