@@ -99,17 +99,17 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
         )
 
     def triton_hash_code(x, code, pack_weight):
-        input_dim = x.shape[-1]
-        samples = x.shape[0]
-        hash_bits = code.shape[-1]
-        assert (pack_weight.shape[0] == 8) and (hash_bits % 8 == 0)
-        hash_out = torch.empty(
-            (samples, hash_bits // 8), dtype=pack_weight.dtype, device=x.device
-        )
+        m = x.shape[:-1]
+        K = x.shape[-1]
+        x = x.reshape(-1, K)
+        M = x.shape[0]
+        _, N = code.shape
+        assert (pack_weight.shape[0] == 8) and (N % 8 == 0)
+        hash_out = torch.empty((M, N // 8), dtype=pack_weight.dtype, device=x.device)
 
         grid = lambda opts: (
-            triton.cdiv(samples, opts["BLOCK_M"]),
-            triton.cdiv(input_dim, opts["BLOCK_N"]),
+            triton.cdiv(M, opts["BLOCK_M"]),
+            triton.cdiv(N, opts["BLOCK_N"]),
         )
 
         triton_hash_code_kernel[grid](
@@ -117,9 +117,9 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
             code,
             pack_weight,
             hash_out,
-            samples,
-            input_dim,
-            hash_bits,
+            M,
+            K,
+            N,
             x.stride(0),
             x.stride(1),
             code.stride(0),
@@ -131,8 +131,7 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
             BLOCK_K=64,
             BLOCK_N=16,
         )
-
-        return hash_out.view(-1)  # [samples * hash_numbers]
+        return hash_out.view((*m, N // 8))
 
 
 @torch.compile()
@@ -146,7 +145,6 @@ def torch_hash_code(x, code, pack_weight):
     # binary_codes * self.bit_masks [N, hash_numbers, 8] * [1, 1, 8] -> [N, hash_numbers, 8]
     # then sum along the last dimension to get [N, hash_numbers]
     x = torch.sum(x * pack_weight, dim=-1, dtype=torch.uint8)
-    x = x.view(-1)  # [N * hash_numbers]
     return x
 
 
@@ -185,6 +183,12 @@ class HashEncoder:
             logger.warning("automatically using  float32 for hash_weights now")
             self.dtype = torch.float32
 
+        self._init_hash_weights()
+
+        if self.device.type == "cuda" or self.device.type == "cpu":
+            self._init_bit_masks()
+
+    def _init_hash_weights(self):
         # Step 1: 随机高斯矩阵
         random_weights = torch.normal(
             mean=0,
@@ -199,10 +203,7 @@ class HashEncoder:
         # Step 3: 调整符号，保证Haar 分布
         d = torch.sign(torch.diag(R))
         self.hash_weights = Q * d
-
-        if self.device.type == "cuda" or self.device.type == "cpu":
-            self._init_bit_masks()
-
+    
     def set_hash_weight(self, hash_weights: torch.Tensor) -> None:
         if hash_weights.shape != (self.input_dim, self.hash_bits):
             raise ValueError(
@@ -247,7 +248,7 @@ class HashEncoder:
         orig_shape = x.shape[:-1]
 
         # [N, input_dim], e.g., N = s1*s2*s3
-        x_flat = x.view(-1, self.input_dim)
+        x_flat = x.reshape(-1, self.input_dim)
 
         if x_flat.dtype != self.dtype:
             x_flat = x_flat.to(self.dtype)
@@ -263,12 +264,12 @@ class HashEncoder:
         elif self.device.type == "cuda":
             packed_codes_flat = triton_hash_code(
                 x_flat, self.hash_weights, self.bit_masks
-            )  # [N * hash_numbers]
+            ).view(-1)  # [N * hash_numbers]
 
         elif self.device.type == "cpu":
             packed_codes_flat = torch_hash_code(
                 x_flat, self.hash_weights, self.bit_masks
-            )  # [N * hash_numbers]
+            ).view(-1)  # [N * hash_numbers]
 
         else:
             raise ValueError(f"Unsupported device type: {self.device.type}")

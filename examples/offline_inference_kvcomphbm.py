@@ -77,7 +77,9 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
                     },
                 }
             ],
-            "ucm_sparse_config": {"KvCompOnDevice": {}},
+            "ucm_sparse_config": {"KvCompOnDevice": {
+                "kvcompOnDevice_config_path": "/home/sxl/va_test/unified-cache-management/ucm/sparse/kvcomp/configs/kvcomp_deepseek_v2_lite_hbm_config.json"
+            }},
         },
     )
 
@@ -90,7 +92,7 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
         block_size=128,
         enforce_eager=True,
         distributed_executor_backend="mp",
-        tensor_parallel_size=2,
+        tensor_parallel_size=1,
         trust_remote_code=True,
     )
 
