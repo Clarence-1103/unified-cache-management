@@ -132,96 +132,120 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
             BLOCK_N=16,
         )
         return hash_out.view((*m, N // 8))
-    
+
     @triton.jit
     def _reshape_and_cache_khash_kernel(
-        k_in_ptr,              # *T x 8 x 8
-        slot_ptr,              # *T
-        k_cache_ptr,           # *B x BS x 8 x 8
+        k_in_ptr,  # [T, H, W]
+        slot_ptr,  # [T]
+        k_cache_ptr,  # [B, BS, H, W]
         n_tokens: tl.constexpr,
-
+        H: tl.constexpr,  # H 作为 constexpr 更快（见下方 wrapper 解释）
+        W: tl.constexpr,  # W 作为 constexpr 更快
         # strides for k_in: [T, H, W]
         in_stride_t: tl.constexpr,
         in_stride_h: tl.constexpr,
         in_stride_w: tl.constexpr,
-
         # strides for k_cache: [B, BS, H, W]
         cache_stride_b: tl.constexpr,
         cache_stride_s: tl.constexpr,
         cache_stride_h: tl.constexpr,
         cache_stride_w: tl.constexpr,
-
-        block_size: tl.constexpr,   # e.g. 128
+        block_size: tl.constexpr,  # BS (e.g. 128)
+        cache_num_slots: tl.constexpr,  # B*BS，用于上界检查
+        BLOCK: tl.constexpr,  # 每个 program 处理的元素数（1D）
     ):
-        pid = tl.program_id(0)  # one program per token
+        pid_t = tl.program_id(0)  # token id
+        pid_c = tl.program_id(1)  # chunk id
 
-        # guard
-        if tl.static_assert(True):
-            pass
-        token_mask = pid < n_tokens
-        if not token_mask:
+        if pid_t >= n_tokens:
             return
 
-        # slot mapping (int32/int64)
-        slot = tl.load(slot_ptr + pid, mask=token_mask, other=-1).to(tl.int64)
-        # skip invalid
+        # slot mapping
+        slot = tl.load(slot_ptr + pid_t).to(tl.int64)
         if slot < 0:
+            return
+        # 上界检查：避免 slot_mapping 脏值写爆缓存
+        if slot >= cache_num_slots:
             return
 
         b = slot // block_size
         s = slot - b * block_size
 
-        # We copy a 8x8 tile = 64 elements
-        offs = tl.arange(0, 64)  # [0..63]
-        h = offs // 8
-        w = offs - h * 8
+        # flatten HW 并按 chunk 拷贝
+        n_elems = H * W
+        offs = pid_c * BLOCK + tl.arange(0, BLOCK)  # [BLOCK]
+        mask = offs < n_elems
 
-        # load from k_in[pid, h, w]
-        in_ptrs = k_in_ptr + pid * in_stride_t + h * in_stride_h + w * in_stride_w
-        x = tl.load(in_ptrs, mask=token_mask, other=0)
+        # 由 flatten offset -> (h,w)
+        h = offs // W
+        w = offs - h * W
 
-        # store to k_cache[b, s, h, w]
-        out_ptrs = (k_cache_ptr
-                    + b * cache_stride_b
-                    + s * cache_stride_s
-                    + h * cache_stride_h
-                    + w * cache_stride_w)
-        tl.store(out_ptrs, x, mask=token_mask)
+        # load k_in[pid_t, h, w]
+        in_ptrs = k_in_ptr + pid_t * in_stride_t + h * in_stride_h + w * in_stride_w
+        x = tl.load(in_ptrs, mask=mask, other=0)
 
+        # store k_cache[b, s, h, w]
+        out_ptrs = (
+            k_cache_ptr
+            + b * cache_stride_b
+            + s * cache_stride_s
+            + h * cache_stride_h
+            + w * cache_stride_w
+        )
+        tl.store(out_ptrs, x, mask=mask)
 
     def reshape_and_cache_khash_triton(
-        k_hash_compute: torch.Tensor,     # [T, 8, 8]
-        slot_mapping: torch.Tensor,       # [T]
-        k_hash: torch.Tensor,             # [B, BS, 8, 8]
+        k_hash_compute: torch.Tensor,  # [T, H, W]
+        slot_mapping: torch.Tensor,  # [T]
+        k_hash: torch.Tensor,  # [B, BS, H, W]
         block_size: int = 128,
     ):
-        """
-        Triton reshape+cache for k_hash only.
-        Writes: k_hash[slot//BS, slot%BS, :, :] = k_hash_compute[token, :, :]
-
-        Requirements:
-        - tensors on CUDA
-        - k_hash_compute shape [T,8,8]
-        - k_hash shape [B,BS,8,8], where BS == block_size
-        - slot_mapping shape [T], values in [-1, B*BS-1]
-        """
         assert k_hash_compute.is_cuda and k_hash.is_cuda and slot_mapping.is_cuda
-        # assert k_hash_compute.ndim == 3 and k_hash_compute.shape[1:] == (8, 8)
-        # assert k_hash.ndim == 4 and k_hash.shape[1:] == (block_size, 8, 8)
-        assert slot_mapping.ndim == 1 and slot_mapping.shape[0] == k_hash_compute.shape[0]
+        assert k_hash_compute.ndim == 3, f"expect [T,H,W], got {k_hash_compute.shape}"
+        assert k_hash.ndim == 4, f"expect [B,BS,H,W], got {k_hash.shape}"
+        assert (
+            slot_mapping.ndim == 1 and slot_mapping.shape[0] == k_hash_compute.shape[0]
+        )
+        assert (
+            k_hash.shape[1] == block_size
+        ), f"k_hash BS={k_hash.shape[1]} != block_size={block_size}"
+        assert (
+            k_hash_compute.shape[1:] == k_hash.shape[2:]
+        ), f"shape mismatch: compute {k_hash_compute.shape[1:]} vs cache {k_hash.shape[2:]}"
 
-        # Make sure strides are in elements (not bytes) — torch strides already are elements.
+        T, H, W = k_hash_compute.shape
+        B = k_hash.shape[0]
+        cache_num_slots = B * block_size
+
+        # strides are in elements
         in_stride_t, in_stride_h, in_stride_w = k_hash_compute.stride()
         cache_stride_b, cache_stride_s, cache_stride_h, cache_stride_w = k_hash.stride()
 
-        n_tokens = k_hash_compute.shape[0]
+        n_elems = H * W
 
-        grid = (triton.cdiv(n_tokens, 1),)  # 1 program per token
+        # 选一个 BLOCK（必须 constexpr），并用 chunk 维度覆盖 n_elems
+        # 你也可以按性能调整这些档位
+        if n_elems <= 256:
+            BLOCK = 256
+            num_warps = 4
+        elif n_elems <= 512:
+            BLOCK = 512
+            num_warps = 8
+        else:
+            BLOCK = 1024
+            num_warps = 8  # 1024 元素一般 8 warps 足够；更大可再调
+
+        n_chunks = triton.cdiv(n_elems, BLOCK)
+
+        grid = (T, n_chunks)
+
         _reshape_and_cache_khash_kernel[grid](
             k_hash_compute,
             slot_mapping,
             k_hash,
-            n_tokens=n_tokens,
+            n_tokens=T,
+            H=H,
+            W=W,
             in_stride_t=in_stride_t,
             in_stride_h=in_stride_h,
             in_stride_w=in_stride_w,
@@ -230,10 +254,11 @@ if hasattr(torch, "cuda") and torch.cuda.is_available():
             cache_stride_h=cache_stride_h,
             cache_stride_w=cache_stride_w,
             block_size=block_size,
-            num_warps=1,   # 64 elements copy, 1 warp is enough
+            cache_num_slots=cache_num_slots,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
         )
         return k_hash
-    
 
 
 @torch.compile()
@@ -305,7 +330,7 @@ class HashEncoder:
         # Step 3: 调整符号，保证Haar 分布
         d = torch.sign(torch.diag(R))
         self.hash_weights = Q * d
-    
+
     def set_hash_weight(self, hash_weights: torch.Tensor) -> None:
         if hash_weights.shape != (self.input_dim, self.hash_bits):
             raise ValueError(
@@ -366,12 +391,16 @@ class HashEncoder:
         elif self.device.type == "cuda":
             packed_codes_flat = triton_hash_code(
                 x_flat, self.hash_weights, self.bit_masks
-            ).view(-1)  # [N * hash_numbers]
+            ).view(
+                -1
+            )  # [N * hash_numbers]
 
         elif self.device.type == "cpu":
             packed_codes_flat = torch_hash_code(
                 x_flat, self.hash_weights, self.bit_masks
-            ).view(-1)  # [N * hash_numbers]
+            ).view(
+                -1
+            )  # [N * hash_numbers]
 
         else:
             raise ValueError(f"Unsupported device type: {self.device.type}")
